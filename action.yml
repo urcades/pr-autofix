@@ -1,0 +1,107 @@
+name: "PR Autofix with Claude Code"
+description: "Automatically fix PR review comments using Claude Code"
+
+inputs:
+  anthropic_api_key:
+    description: "Anthropic API key for Claude Code"
+    required: true
+  github_token:
+    description: "GitHub token with repo write access"
+    required: true
+  max_iterations:
+    description: "Maximum autofix iterations per PR"
+    required: false
+    default: "5"
+  allowed_bots:
+    description: "Comma-separated list of bot usernames allowed to trigger fixes"
+    required: false
+    default: ""
+  config_file:
+    description: "Path to per-repo autofix config file"
+    required: false
+    default: ".autofix.yml"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout PR branch
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ inputs.github_token }}
+
+    - name: Resolve PR ref
+      id: pr-ref
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+      run: |
+        # issue_comment events don't carry head.ref — resolve it via gh
+        if [ "${{ github.event_name }}" = "issue_comment" ]; then
+          PR_NUMBER="${{ github.event.issue.number }}"
+          BRANCH=$(gh pr view "$PR_NUMBER" --json headRefName -q '.headRefName')
+        else
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          BRANCH="${{ github.event.pull_request.head.ref }}"
+        fi
+        echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+        echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+        git checkout "$BRANCH"
+
+    - name: Guard checks
+      id: guard
+      shell: bash
+      env:
+        EVENT_PATH: ${{ github.event_path }}
+        MAX_ITERATIONS: ${{ inputs.max_iterations }}
+        ALLOWED_BOTS: ${{ inputs.allowed_bots }}
+        CONFIG_FILE: ${{ inputs.config_file }}
+        GH_TOKEN: ${{ inputs.github_token }}
+        PR_NUMBER: ${{ steps.pr-ref.outputs.pr_number }}
+      run: |
+        source "${{ github.action_path }}/scripts/parse-event.sh"
+        echo "should_fix=$should_fix" >> "$GITHUB_OUTPUT"
+        echo "comment_body<<AUTOFIX_EOF" >> "$GITHUB_OUTPUT"
+        echo "$comment_body" >> "$GITHUB_OUTPUT"
+        echo "AUTOFIX_EOF" >> "$GITHUB_OUTPUT"
+        echo "comment_path=$comment_path" >> "$GITHUB_OUTPUT"
+        echo "comment_line=$comment_line" >> "$GITHUB_OUTPUT"
+        echo "iteration=$iteration" >> "$GITHUB_OUTPUT"
+        {
+          echo "pr_diff<<AUTOFIX_DIFF_EOF"
+          echo "$pr_diff"
+          echo "AUTOFIX_DIFF_EOF"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Install Claude Code
+      if: steps.guard.outputs.should_fix == 'true'
+      shell: bash
+      run: npm install -g @anthropic-ai/claude-code
+
+    - name: Run fix
+      if: steps.guard.outputs.should_fix == 'true'
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
+        COMMENT_BODY: ${{ steps.guard.outputs.comment_body }}
+        COMMENT_PATH: ${{ steps.guard.outputs.comment_path }}
+        COMMENT_LINE: ${{ steps.guard.outputs.comment_line }}
+        PR_DIFF: ${{ steps.guard.outputs.pr_diff }}
+      run: bash "${{ github.action_path }}/scripts/run-fix.sh"
+
+    - name: Commit and push
+      if: steps.guard.outputs.should_fix == 'true'
+      shell: bash
+      env:
+        ITERATION: ${{ steps.guard.outputs.iteration }}
+        MAX_ITERATIONS: ${{ inputs.max_iterations }}
+      run: |
+        if [ -z "$(git status --porcelain)" ]; then
+          echo "No changes to commit"
+          exit 0
+        fi
+        git config user.name "pr-autofix[bot]"
+        git config user.email "pr-autofix[bot]@users.noreply.github.com"
+        git add -A
+        git commit -m "autofix: address review comment [$ITERATION/$MAX_ITERATIONS]"
+        git push
